@@ -1,0 +1,7 @@
+FROM node:20-alpine
+
+WORKDIR /app
+COPY . .
+RUN npm ci --include-workspace-root --workspaces
+
+CMD ["npm", "run", "start", "--workspace", "workers", "--", "--watch"]

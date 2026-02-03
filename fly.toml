@@ -1,0 +1,14 @@
+# fly.toml app configuration file generated for meerkat-worker on 2026-02-03T18:23:29Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'meerkat-worker'
+primary_region = 'lhr'
+
+[build]
+  dockerfile = 'Dockerfile.worker'
+
+[[vm]]
+  memory = '256mb'
+  cpus = 1

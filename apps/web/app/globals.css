@@ -1,0 +1,169 @@
+@import "tailwindcss";
+
+:root {
+  --color-brand: #fb7a29;
+  --color-brand-strong: #e05e0f;
+  --color-brand-soft: #ffe7d6;
+  --color-text-on-brand: #ffffff;
+
+  --color-surface-base: #f5f7fb;
+  --color-surface-card: #ffffff;
+  --color-surface-muted: #eff2f7;
+  --color-surface-hover: #e3e8f2;
+  --color-border-muted: #e2e8f0;
+
+  --color-text-primary: #0f172a;
+  --color-text-muted: #64748b;
+  --color-heading: #0b1220;
+  --color-icon: #475569;
+
+  --color-success: #0f9d58;
+  --color-success-soft: #dcfce7;
+  --color-success-soft-strong: #bbf7d0;
+  --color-success-ink: #05603a;
+
+  --color-danger: #dc2626;
+  --color-danger-strong: #b91c1c;
+  --color-danger-soft: #fee2e2;
+  --color-danger-ink: #991b1b;
+
+  --color-warning-soft: #fef3c7;
+  --color-warning-ink: #92400e;
+
+  --color-neutral-soft: #e2e8f0;
+  --color-neutral-ink: #475569;
+}
+
+:root[data-theme="light"] {
+  --color-brand: #fb7a29;
+  --color-brand-strong: #e05e0f;
+  --color-brand-soft: #ffe7d6;
+  --color-text-on-brand: #ffffff;
+
+  --color-surface-base: #f5f7fb;
+  --color-surface-card: #ffffff;
+  --color-surface-muted: #eff2f7;
+  --color-surface-hover: #e3e8f2;
+  --color-border-muted: #e2e8f0;
+
+  --color-text-primary: #0f172a;
+  --color-text-muted: #64748b;
+  --color-heading: #0b1220;
+  --color-icon: #475569;
+
+  --color-success: #0f9d58;
+  --color-success-soft: #dcfce7;
+  --color-success-soft-strong: #bbf7d0;
+  --color-success-ink: #05603a;
+
+  --color-danger: #dc2626;
+  --color-danger-strong: #b91c1c;
+  --color-danger-soft: #fee2e2;
+  --color-danger-ink: #991b1b;
+
+  --color-warning-soft: #fef3c7;
+  --color-warning-ink: #92400e;
+
+  --color-neutral-soft: #e2e8f0;
+  --color-neutral-ink: #475569;
+}
+
+:root[data-theme="dark"] {
+  --color-brand: #ff944d;
+  --color-brand-strong: #ff7a26;
+  --color-brand-soft: #402816;
+  --color-text-on-brand: #0a0502;
+
+  --color-surface-base: #050d1a;
+  --color-surface-card: #0f172a;
+  --color-surface-muted: #111c30;
+  --color-surface-hover: #1d2940;
+  --color-border-muted: #1f2b40;
+
+  --color-text-primary: #f8fbff;
+  --color-text-muted: #92a1c1;
+  --color-heading: #fafbfd;
+  --color-icon: #b4c2df;
+
+  --color-success: #0f9d58;
+  --color-success-soft: #0d2a1f;
+  --color-success-soft-strong: #123828;
+  --color-success-ink: #6be3a1;
+
+  --color-danger: #dc2626;
+  --color-danger-strong: #b91c1c;
+  --color-danger-soft: #2f1414;
+  --color-danger-ink: #ff8a8a;
+
+  --color-warning-soft: #2f2411;
+  --color-warning-ink: #ffce71;
+
+  --color-neutral-soft: #1a2336;
+  --color-neutral-ink: #d1dbf2;
+}
+
+@theme inline {
+  --color-background: var(--color-surface-base);
+  --color-foreground: var(--color-text-primary);
+  --color-brand: var(--color-brand);
+  --color-brand-strong: var(--color-brand-strong);
+  --color-surface-muted: var(--color-surface-muted);
+  --color-border-muted: var(--color-border-muted);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --color-brand: #ff944d;
+    --color-brand-strong: #ff7a26;
+    --color-brand-soft: #402816;
+    --color-text-on-brand: #0a0502;
+
+    --color-surface-base: #050d1a;
+    --color-surface-card: #0f172a;
+    --color-surface-muted: #111c30;
+    --color-surface-hover: #1d2940;
+    --color-border-muted: #1f2b40;
+
+    --color-text-primary: #f8fbff;
+    --color-text-muted: #92a1c1;
+    --color-heading: #fafbfd;
+    --color-icon: #b4c2df;
+
+    --color-success: #0f9d58;
+    --color-success-soft: #0d2a1f;
+    --color-success-soft-strong: #123828;
+    --color-success-ink: #6be3a1;
+
+    --color-danger: #dc2626;
+    --color-danger-strong: #b91c1c;
+    --color-danger-soft: #2f1414;
+    --color-danger-ink: #ff8a8a;
+
+    --color-warning-soft: #2f2411;
+    --color-warning-ink: #ffce71;
+
+    --color-neutral-soft: #1a2336;
+    --color-neutral-ink: #d1dbf2;
+  }
+}
+
+body {
+  background: var(--color-surface-base);
+  color: var(--color-text-primary);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  color: var(--color-heading);
+}
+
+svg {
+  color: var(--color-icon);
+}

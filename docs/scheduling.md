@@ -8,9 +8,11 @@ This document captures the lightweight scheduling approach we will implement bef
 2. **`pending_checks` table** – A Postgres queue that stores one row per scheduled job. Columns include `monitor_id`, `org_id`, `scheduled_for`, `attempts`, `locked_at`, and `lock_id`. Jobs stay in this table until a worker finishes them or marks them failed.
 3. **Supabase Cron (every minute)** – Runs a SQL function that finds due monitors and inserts rows into `pending_checks` while bumping `next_check_at += interval`. Cron executions are free on Supabase and live entirely inside the database.
 4. **Worker process** – A Node script (planned under `apps/worker`) that polls `pending_checks` using `FOR UPDATE SKIP LOCKED`, processes the job with `runBaselineCheck()`, writes to `checks`, updates the monitor, and removes the row (or reschedules on failure). The worker uses the service-role key so it can bypass RLS safely.
+   declare
+
 ## Supabase Cron Function
 
-The function lives at `supabase/functions/enqueue_due_checks.sql`. Deploy it with `supabase db push --file supabase/functions/enqueue_due_checks.sql` (or `supabase db execute < file`).
+The function lives at `supabase/functions/enqueue_due_checks.sql`. Deploy it with `supabase db push --file supabase/functions/enqueue_due_checks.sql` (or `supabase db execute < file`). The `pending_checks_monitor_unique` index from `supabase/migrations/0004_pending_checks_unique.sql` must exist so the `on conflict` clause works.
 
 ```sql
 create or replace function public.enqueue_due_checks(max_jobs integer default 200)
@@ -18,8 +20,8 @@ returns integer
 language plpgsql
 as $$
 declare
-  inserted integer;
-
+  inserted_count integer;
+begin
   with due as (
     select id, org_id, interval_minutes
     from public.monitors
@@ -33,26 +35,38 @@ declare
     select id, org_id, now()
     from due
     on conflict (monitor_id) do nothing
-    returning 1
+    returning monitor_id
+  ), bumped as (
+    update public.monitors m
+      set next_check_at = greatest(coalesce(m.next_check_at, now()), now()) + (m.interval_minutes || ' minutes')::interval
+    from due
+    where m.id = due.id
+    returning m.id
   )
-  update public.monitors m
-    set next_check_at = greatest(coalesce(m.next_check_at, now()), now()) + (m.interval_minutes || ' minutes')::interval
-  from due
-  where m.id = due.id;
+  select count(*)
+  into inserted_count
+  from inserted;
 
-  select count(*) into inserted from inserted;
-  return coalesce(inserted, 0);
+  return coalesce(inserted_count, 0);
 end;
 $$;
 ```
 
-Schedule it in Supabase → Database → Scheduled tasks → New schedule:
+Schedule it in Supabase Studio → **Integrations → Cron**:
 
-1. Name: `enqueue-monitor-checks`
-2. Cron: `* * * * *`
-3. SQL: `select public.enqueue_due_checks();`
+1. Enable the pg_cron integration if it isn’t already active.
+2. Click “New Cron Job”, choose **SQL snippet**, and paste `select public.enqueue_due_checks();`
+3. Set the cron expression to `* * * * *` so it runs every minute.
 
-Or via CLI: `supabase db remote commit --name enqueue-monitor-checks --schedule "* * * * *" --sql "select public.enqueue_due_checks();"`
+CLI alternative (once pg_cron is enabled):
+
+```bash
+supabase db remote commit \
+  --name enqueue-monitor-checks \
+  --schedule "* * * * *" \
+  --sql "select public.enqueue_due_checks();"
+```
+
 ## Worker Flow
 
 1. Poll for jobs: `select * from pending_checks where scheduled_for <= now() and locked_at is null order by scheduled_for limit N for update skip locked;`
@@ -75,13 +89,13 @@ Or via CLI: `supabase db remote commit --name enqueue-monitor-checks --schedule 
 
 ## Worker Hosting Options
 
-| Host | Est. cost | Pros | Considerations |
-|------|-----------|------|----------------|
-| Fly.io shared-cpu-1x | ~$5/mo | Simple scaling, health checks, global regions | Needs Dockerfile, keep instance awake |
-| Railway | Free dev tier, then ~$5 | Git integration, ephemeral previews | Sleeps on inactivity unless paid |
-| Render background worker | ~$7/mo | Auto-redeploy, metrics/logs built in | Slightly higher floor cost |
-| Supabase Edge Functions | $0 | Already provisioned in project | Too short-lived for continuous polling |
-| Self-hosted VM (DO/Lightsail) | $5/mo | Full control, predictable cost | Manual updates/monitoring |
+| Host                          | Est. cost               | Pros                                          | Considerations                         |
+| ----------------------------- | ----------------------- | --------------------------------------------- | -------------------------------------- |
+| Fly.io shared-cpu-1x          | ~$5/mo                  | Simple scaling, health checks, global regions | Needs Dockerfile, keep instance awake  |
+| Railway                       | Free dev tier, then ~$5 | Git integration, ephemeral previews           | Sleeps on inactivity unless paid       |
+| Render background worker      | ~$7/mo                  | Auto-redeploy, metrics/logs built in          | Slightly higher floor cost             |
+| Supabase Edge Functions       | $0                      | Already provisioned in project                | Too short-lived for continuous polling |
+| Self-hosted VM (DO/Lightsail) | $5/mo                   | Full control, predictable cost                | Manual updates/monitoring              |
 
 Pick the host that matches budget + ops comfort. Worker only needs `DATABASE_URL`, so even tiny instances work. Use `npm run start --workspace workers` for 24/7 polling or hook that command to an external scheduler.
 

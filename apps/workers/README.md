@@ -27,3 +27,14 @@ WORKER_MAX_ATTEMPTS=5            # optional, defaults to 5
 4. On failure, increments `attempts`, records the error, and reschedules with exponential backoff (capped at 60 minutes).
 
 The same process will later handle change detection, diff generation, and notifications once those queues are defined.
+
+## Deploying to Fly.io
+
+The repo includes [Dockerfile.worker](../../Dockerfile.worker) and [fly.toml](../../fly.toml) so this worker can run on a tiny Fly machine.
+
+1. Install flyctl and log in: `brew install flyctl && fly auth login`
+2. (First-time only) `fly launch --name meerkat-worker --dockerfile Dockerfile.worker --no-deploy`
+3. Provide secrets: `fly secrets set DATABASE_URL="postgresql://..."`
+4. Deploy: `fly deploy --dockerfile Dockerfile.worker`
+
+Scale with `fly scale count <n>` and inspect logs via `fly logs -a meerkat-worker`. The same Dockerfile works on any other container host if you prefer Railway/Render/etc.

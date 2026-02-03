@@ -21,7 +21,24 @@ A ChangeTower-style SaaS for monitoring page and section changes. This repo host
 ## Structure
 
 - `apps/web` — Next.js App Router UI (Tailwind, TypeScript)
-- `apps/workers` — (planned) job runners for crawling + notifications
-- `packages/*` — shared domain logic and UI primitives (to be added)
+- `apps/workers` — Node-based queue processor that runs scheduled checks
+- `supabase/` — SQL migrations plus server-side functions (e.g., `enqueue_due_checks`)
+- `docs/` — architecture notes such as [docs/scheduling.md](docs/scheduling.md)
 
 See [spec.md](spec.md) and [spec2.md](spec2.md) for the evolving product/engineering plan.
+
+## Scheduling & Worker Deployment
+
+The monitoring loop is intentionally lightweight—Postgres + Supabase Cron keep the schedule, and `apps/workers` does the actual fetches.
+
+1. **Deploy the cron function**
+   - `supabase db push --file supabase/functions/enqueue_due_checks.sql`
+   - This SQL relies on the `pending_checks_monitor_unique` index added in `supabase/migrations/0004_pending_checks_unique.sql`.
+2. **Create the cron job**
+   - Supabase Studio → Integrations → **Cron** → Enable `pg_cron`
+   - “New Cron Job” → SQL snippet `select public.enqueue_due_checks();` with schedule `* * * * *`
+3. **Run the worker**
+   - Locally: `DATABASE_URL="postgresql://..." npm run start --workspace workers -- --watch`
+   - Hosted: use the provided [Dockerfile.worker](Dockerfile.worker) with Fly.io (`fly launch --dockerfile Dockerfile.worker`, `fly secrets set DATABASE_URL=...`, `fly deploy`)
+
+Full queue behavior, failure handling, and hosting options are documented in [docs/scheduling.md](docs/scheduling.md).

@@ -23,9 +23,66 @@ A ChangeTower-style SaaS for monitoring page and section changes. This repo host
 - `apps/web` — Next.js App Router UI (Tailwind, TypeScript)
 - `apps/workers` — Node-based queue processor that runs scheduled checks
 - `supabase/` — SQL migrations plus server-side functions (e.g., `enqueue_due_checks`)
-- `docs/` — architecture notes such as [docs/scheduling.md](docs/scheduling.md)
+- `docs/` — architecture notes such as [docs/scheduling.md](docs/scheduling.md) and [docs/change-events.md](docs/change-events.md)
 
 See [spec.md](spec.md) and [spec2.md](spec2.md) for the evolving product/engineering plan.
+
+## How It Works (Illustrated)
+
+```mermaid
+flowchart LR
+   subgraph User Experience
+      U[User]
+      UI[Next.js Dashboard]
+      U -->|auth| UI
+      UI -->|create/adjust monitors| DB[(Supabase Postgres)]
+   end
+
+   subgraph Scheduling
+      Cron[Supabase pg_cron]
+      Queue[(pending_checks)]
+      Cron -->|select due monitors| Queue
+   end
+
+   subgraph Worker
+      Worker[Fly.io Worker]
+      Check[runBaselineCheck()]
+      Snap[monitor_snapshots (premium)]
+      Events[change_events]
+      Worker --> Check --> DB
+      Worker --> Snap
+      Snap --> Events
+   end
+
+   Queue -->|jobs| Worker
+   Events --> UI
+   UI -->|change feed| U
+   UI -->|needs attention| U
+```
+
+```
+Users → Next.js dashboard ─┬─ create/adjust monitors (Supabase auth + RLS)
+                                        │
+                                        └─ writes monitor metadata (interval, selector, tier) to Postgres
+
+Supabase Cron (pg_cron) → every minute calls `enqueue_due_checks()`
+                                     └─ moves due monitors into `pending_checks`
+
+Fly.io worker (apps/workers) → polls `pending_checks`
+   ├─ runs `runBaselineCheck()` (HTTP fetch + normalization)
+   ├─ records `checks` rows + updates monitor status/next run
+   └─ for higher tiers (Week 3+):
+          ├─ stores HTML/text snapshots (`monitor_snapshots`)
+          └─ creates `change_events` (+ optional block metadata) when diffs exist
+
+Dashboard UI
+   ├─ Shows Active Monitors table (status lozenges, intervals, sensitivity)
+   ├─ “Needs attention” list highlights failing/paused/stale monitors
+   ├─ “Recent changes” feed reads from `change_events`
+   └─ Quick Add modal lets users spin up new monitors without leaving the page
+
+Notification layer (Week 4+) will subscribe to `change_events` so alerts go out within minutes of a detected change.
+```
 
 ## Scheduling & Worker Deployment
 

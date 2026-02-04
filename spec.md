@@ -706,8 +706,11 @@ Billing:
 
 ### Milestone 3: Change Events & Diff (Week 3)
 
-- Compare baseline, generate change events
-- Diff artifact generation and viewer UI
+- Create `monitor_snapshots` table for raw HTML + normalized text (tier-gated)
+- Record `change_events` with prev/next snapshot references, summaries, severities
+- Compare baseline, generate diff artifacts, and surface them in the UI
+- Lay groundwork for premium semantic analysis (`change_blocks`, retention policies)
+- See [docs/change-events.md](docs/change-events.md) for schema details and worker expectations.
 
 ### Milestone 4: Notifications (Week 4)
 

@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { ChangeTimelineChart } from "@/components/change-timeline-chart";
+import { StatusBadge } from "@/components/status-badge";
 import { MonitorSettingsForm, type EditableMonitor } from "./monitor-settings-form";
 import { formatDate, formatRelative, describeInterval } from "@/lib/formatters";
 import { getServerComponentClient } from "@/lib/supabase/server-clients";
@@ -71,19 +72,6 @@ function severityBadge(severity: ChangeRecord["severity"]) {
       return "bg-[var(--color-warning-soft)] text-[var(--color-warning-ink)]";
     default:
       return "bg-[var(--color-success-soft)] text-[var(--color-success-ink)]";
-  }
-}
-
-function statusColor(status: string | null) {
-  switch (status) {
-    case "ok":
-      return "bg-[var(--color-success-soft)] text-[var(--color-success-ink)]";
-    case "error":
-      return "bg-[var(--color-danger-soft)] text-[var(--color-danger-ink)]";
-    case "blocked":
-      return "bg-[var(--color-warning-soft)] text-[var(--color-warning-ink)]";
-    default:
-      return "bg-[var(--color-neutral-soft)] text-[var(--color-neutral-ink)]";
   }
 }
 
@@ -174,9 +162,7 @@ export default async function MonitorDetailPage({
           </p>
         </div>
         <div className="flex flex-col items-start gap-2 text-sm text-[var(--color-text-muted)] md:items-end">
-          <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusColor(monitor.last_status)}`}>
-            {monitor.last_status ?? "pending"}
-          </span>
+          <StatusBadge status={monitor.last_status} />
           <p>Last checked {formatRelative(monitor.last_checked_at)}</p>
           <p>Interval • {describeInterval(monitor.interval_minutes)}</p>
           <p>{monitor.enabled ? "Monitoring" : "Paused"}</p>
@@ -314,9 +300,7 @@ export default async function MonitorDetailPage({
                     <tr key={check.id}>
                       <td className="px-2 py-3 text-[var(--color-text-muted)]">{formatDate(check.started_at)}</td>
                       <td className="px-2 py-3">
-                        <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusColor(check.status)}`}>
-                          {check.status}
-                        </span>
+                        <StatusBadge status={check.status} />
                       </td>
                       <td className="px-2 py-3 text-[var(--color-text-muted)]">{check.http_status ?? "—"}</td>
                     </tr>

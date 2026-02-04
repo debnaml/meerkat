@@ -75,6 +75,17 @@ supabase db remote commit \
 4. Insert a new `checks` row, update the monitor (`last_status`, `last_checked_at`, `last_success_at`, `last_check_id`, `next_check_at`)
 5. Delete the `pending_checks` row. On failure, increment `attempts`, set `error_message`, and schedule retry (e.g., `scheduled_for = now() + interval '5 minutes'`) up to a max attempt count.
 
+### Week 3+ Snapshot & Change Event Storage
+
+To support richer diffs and future premium summaries we will add a tier-aware storage path:
+
+- `monitor_snapshots` table references `checks.id` and holds raw HTML (or a storage pointer), normalized text, content hash, and capture metadata. Workers only persist these blobs for monitors whose org plan includes detailed insights.
+- `change_events` table links `prev_snapshot_id` and `next_snapshot_id`, stores the computed diff summary, severity, and structured metadata. Dashboard feeds will read from here instead of inferring from `monitors.last_change_at`.
+- `change_blocks` (optional follow-up) captures block-level actions (added/removed/edited) so we can eventually say “New job posting added” without reprocessing old snapshots. This table is only populated for higher tiers to control CPU/storage costs.
+- Retention is enforced nightly per tier (e.g., keep 30 days for Standard, 90+ for Premium) so storage stays predictable.
+
+The worker will check plan flags before inserting snapshots or block data, meaning lower tiers continue to run lightweight checks while higher tiers automatically accrue the extra context needed for AI/semantic summaries later.
+
 ## Scaling & Swap Path
 
 - Because everything is orchestrated in SQL, we can scale horizontally by running multiple worker instances; `FOR UPDATE SKIP LOCKED` ensures each job runs once.

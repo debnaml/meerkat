@@ -161,7 +161,7 @@ export default async function MonitorDetailPage({
 
   const [changesResult, checksResult, latestChangeResult] = await Promise.all([
     supabase
-      .from("changes")
+      .from("change_events")
       .select("id, created_at, summary, severity")
       .eq("monitor_id", id)
       .order("created_at", { ascending: false })

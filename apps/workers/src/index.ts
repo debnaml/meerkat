@@ -32,6 +32,8 @@ interface SnapshotSummary {
 interface PlanFeatures {
   detailed_snapshots?: boolean;
   semantic_diff?: boolean;
+  snapshot_retention_days?: number;
+  plan_tier?: string;
 }
 
 interface TextSegment {
@@ -47,6 +49,25 @@ interface SegmentDiffBlob {
   after_excerpt: string | null;
   truncated_prefix: boolean;
   truncated_suffix: boolean;
+}
+
+interface TextExcerptDiffBlob {
+  type: "text_excerpt";
+  before_excerpt: string | null;
+  after_excerpt: string | null;
+}
+
+interface HashOnlyDiffBlob {
+  type: "hash_only";
+}
+
+type DiffBlobPayload = (SegmentDiffBlob | TextExcerptDiffBlob | HashOnlyDiffBlob) & {
+  word_delta?: number;
+};
+
+interface DiffArtifacts {
+  summary: string;
+  diffBlob: DiffBlobPayload;
 }
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -149,6 +170,13 @@ async function handleJob(job: PendingJob) {
   });
 
   const nextCheckAt = addMinutes(baseline.fetchedAt, job.interval_minutes);
+  const snapshotTier = typeof planFeatures.plan_tier === "string" ? planFeatures.plan_tier : null;
+  const snapshotRetentionDays = getSnapshotRetentionDays(planFeatures);
+  const snapshotExpiresAt = snapshotRetentionDays
+    ? addDays(baseline.fetchedAt, snapshotRetentionDays)
+    : null;
+  const storeFullSnapshot = shouldStoreFullSnapshot(planFeatures);
+  const normalizedText = storeFullSnapshot ? baseline.normalizedText : null;
 
   const client = await pool.connect();
   try {
@@ -195,14 +223,15 @@ async function handleJob(job: PendingJob) {
         blocks_json,
         expires_at
       ) values (
-        $1, $2, $3, $4, null, $5, null, null
+        $1, $2, $3, $4, null, $5, null, $6
       ) returning id`,
       [
         job.monitor_id,
         checkId,
-        null,
+        snapshotTier,
         baseline.contentHash,
-        shouldStoreFullSnapshot(planFeatures) ? baseline.normalizedText : null,
+        normalizedText,
+        snapshotExpiresAt,
       ]
     );
     const snapshotId = snapshotResult.rows[0].id;
@@ -225,9 +254,10 @@ async function handleJob(job: PendingJob) {
         previousSnapshot,
         nextSnapshotId: snapshotId,
         newCheckId: checkId,
-        baselineText: shouldStoreFullSnapshot(planFeatures) ? baseline.normalizedText : null,
+        baselineText: normalizedText,
         fetchedAt: baseline.fetchedAt,
         contentHash: baseline.contentHash,
+        planFeatures,
       });
     }
 
@@ -279,6 +309,15 @@ function addMinutes(iso: string, minutes: number) {
   return date.toISOString();
 }
 
+function addDays(iso: string, days: number) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.valueOf())) {
+    return null;
+  }
+  date.setDate(date.getDate() + days);
+  return date.toISOString();
+}
+
 function truncateMessage(message: string, maxLength = 500) {
   return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}...`;
 }
@@ -297,6 +336,17 @@ function shouldStoreFullSnapshot(features: PlanFeatures) {
     return features.detailed_snapshots;
   }
   return true;
+}
+
+function shouldCaptureChangeBlocks(features: PlanFeatures) {
+  return Boolean(features.semantic_diff);
+}
+
+function getSnapshotRetentionDays(features: PlanFeatures) {
+  if (typeof features.snapshot_retention_days === "number" && Number.isFinite(features.snapshot_retention_days)) {
+    return Math.max(1, Math.floor(features.snapshot_retention_days));
+  }
+  return features.semantic_diff ? 90 : 30;
 }
 
 async function loadLatestSnapshot(client: PoolClient, monitorId: string): Promise<SnapshotSummary | null> {
@@ -320,6 +370,7 @@ interface RecordChangeEventInput {
   baselineText: string | null;
   fetchedAt: string;
   contentHash: string;
+  planFeatures: PlanFeatures;
 }
 
 async function recordChangeEvent(input: RecordChangeEventInput) {
@@ -333,7 +384,7 @@ async function recordChangeEvent(input: RecordChangeEventInput) {
     ...diffArtifacts.diffBlob,
   });
 
-  await input.client.query(
+  const changeEventResult = await input.client.query<{ id: string }>(
     `insert into public.change_events (
       monitor_id,
       prev_snapshot_id,
@@ -344,7 +395,7 @@ async function recordChangeEvent(input: RecordChangeEventInput) {
       diff_blob
     ) values (
       $1, $2, $3, 'content', $4, $5, $6::jsonb
-    )`,
+    ) returning id`,
     [
       input.job.monitor_id,
       input.previousSnapshot.id,
@@ -354,6 +405,7 @@ async function recordChangeEvent(input: RecordChangeEventInput) {
       diffBlobJson,
     ]
   );
+  const changeEventId = changeEventResult.rows[0]?.id ?? null;
 
   await input.client.query(
     `insert into public.changes (
@@ -384,9 +436,18 @@ async function recordChangeEvent(input: RecordChangeEventInput) {
      where id = $1`,
     [input.job.monitor_id, input.fetchedAt]
   );
+
+  if (changeEventId && shouldCaptureChangeBlocks(input.planFeatures)) {
+    await insertPrimaryChangeBlock({
+      client: input.client,
+      changeEventId,
+      diffBlob: diffArtifacts.diffBlob,
+      summary: diffArtifacts.summary,
+    });
+  }
 }
 
-function summarizeDiff(beforeText: string | null, afterText: string | null) {
+function summarizeDiff(beforeText: string | null, afterText: string | null): DiffArtifacts {
   if (!beforeText || !afterText) {
     return {
       summary: "Content updated",
@@ -458,9 +519,9 @@ function buildSegmentDiff(beforeText: string, afterText: string): SegmentDiffBlo
   };
 }
 
-function createExcerptBlob(beforeText: string, afterText: string) {
+function createExcerptBlob(beforeText: string, afterText: string): TextExcerptDiffBlob {
   return {
-    type: "text_excerpt" as const,
+    type: "text_excerpt",
     before_excerpt: beforeText.slice(0, 400),
     after_excerpt: afterText.slice(0, 400),
   };
@@ -562,6 +623,95 @@ function sliceLength(changes: Change[], start: number, end: number) {
     total += chunkLength(changes[index]);
   }
   return total;
+}
+
+interface PrimaryBlockParams {
+  client: PoolClient;
+  changeEventId: string;
+  diffBlob: DiffBlobPayload;
+  summary: string;
+}
+
+async function insertPrimaryChangeBlock(params: PrimaryBlockParams) {
+  if (!isSegmentDiffBlobPayload(params.diffBlob)) {
+    return;
+  }
+
+  const action = determineBlockAction(params.diffBlob);
+  const excerpt = params.diffBlob.after_excerpt ?? params.diffBlob.before_excerpt ?? params.summary;
+  const title = buildBlockTitle(params.summary, excerpt);
+  const metadata = {
+    truncated_prefix: params.diffBlob.truncated_prefix,
+    truncated_suffix: params.diffBlob.truncated_suffix,
+    word_delta: params.diffBlob.word_delta ?? null,
+  };
+
+  await params.client.query(
+    `insert into public.change_blocks (
+      change_event_id,
+      block_key,
+      action,
+      title,
+      text_excerpt,
+      metadata
+    ) values (
+      $1, $2, $3, $4, $5, $6::jsonb
+    )`,
+    [
+      params.changeEventId,
+      "primary",
+      action,
+      title,
+      excerpt ? truncateToLength(excerpt, 600) : null,
+      JSON.stringify(metadata),
+    ]
+  );
+}
+
+function isSegmentDiffBlobPayload(blob: DiffBlobPayload | null | undefined): blob is DiffBlobPayload & SegmentDiffBlob {
+  return Boolean(
+    blob &&
+      blob.type === "text_segments" &&
+      Array.isArray((blob as SegmentDiffBlob).before_segments) &&
+      Array.isArray((blob as SegmentDiffBlob).after_segments)
+  );
+}
+
+function determineBlockAction(blob: SegmentDiffBlob & { word_delta?: number }) {
+  const hasBefore = blob.before_segments?.some((segment) => segment.kind !== "context");
+  const hasAfter = blob.after_segments?.some((segment) => segment.kind !== "context");
+  if (!hasBefore && hasAfter) {
+    return "added";
+  }
+  if (hasBefore && !hasAfter) {
+    return "removed";
+  }
+  if (typeof blob.word_delta === "number") {
+    if (blob.word_delta > 0) return "added";
+    if (blob.word_delta < 0) return "removed";
+  }
+  return "modified";
+}
+
+function buildBlockTitle(summary: string, excerpt: string | null) {
+  if (summary && summary !== "Content updated") {
+    return truncateToLength(summary, 120);
+  }
+  if (excerpt) {
+    const firstSentence = excerpt.split(/(?<=[.!?])\s+/)[0] ?? excerpt;
+    return truncateToLength(firstSentence, 120);
+  }
+  return "Content updated";
+}
+
+function truncateToLength(value: string | null, maxLength: number) {
+  if (!value) {
+    return null;
+  }
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength)}...`;
 }
 
 main().catch((error) => {

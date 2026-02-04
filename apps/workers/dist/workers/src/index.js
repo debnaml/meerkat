@@ -91,6 +91,13 @@ async function handleJob(job) {
         selector: job.selector_css,
     });
     const nextCheckAt = addMinutes(baseline.fetchedAt, job.interval_minutes);
+    const snapshotTier = typeof planFeatures.plan_tier === "string" ? planFeatures.plan_tier : null;
+    const snapshotRetentionDays = getSnapshotRetentionDays(planFeatures);
+    const snapshotExpiresAt = snapshotRetentionDays
+        ? addDays(baseline.fetchedAt, snapshotRetentionDays)
+        : null;
+    const storeFullSnapshot = shouldStoreFullSnapshot(planFeatures);
+    const normalizedText = storeFullSnapshot ? baseline.normalizedText : null;
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
@@ -131,13 +138,14 @@ async function handleJob(job) {
         blocks_json,
         expires_at
       ) values (
-        $1, $2, $3, $4, null, $5, null, null
+        $1, $2, $3, $4, null, $5, null, $6
       ) returning id`, [
             job.monitor_id,
             checkId,
-            null,
+            snapshotTier,
             baseline.contentHash,
-            shouldStoreFullSnapshot(planFeatures) ? baseline.normalizedText : null,
+            normalizedText,
+            snapshotExpiresAt,
         ]);
         const snapshotId = snapshotResult.rows[0].id;
         await client.query(`update public.monitors
@@ -154,9 +162,10 @@ async function handleJob(job) {
                 previousSnapshot,
                 nextSnapshotId: snapshotId,
                 newCheckId: checkId,
-                baselineText: shouldStoreFullSnapshot(planFeatures) ? baseline.normalizedText : null,
+                baselineText: normalizedText,
                 fetchedAt: baseline.fetchedAt,
                 contentHash: baseline.contentHash,
+                planFeatures,
             });
         }
         await client.query(`delete from public.pending_checks where id = $1`, [job.id]);
@@ -199,6 +208,14 @@ function addMinutes(iso, minutes) {
     date.setMinutes(date.getMinutes() + minutes);
     return date.toISOString();
 }
+function addDays(iso, days) {
+    const date = new Date(iso);
+    if (Number.isNaN(date.valueOf())) {
+        return null;
+    }
+    date.setDate(date.getDate() + days);
+    return date.toISOString();
+}
 function truncateMessage(message, maxLength = 500) {
     return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}...`;
 }
@@ -215,6 +232,15 @@ function shouldStoreFullSnapshot(features) {
         return features.detailed_snapshots;
     }
     return true;
+}
+function shouldCaptureChangeBlocks(features) {
+    return Boolean(features.semantic_diff);
+}
+function getSnapshotRetentionDays(features) {
+    if (typeof features.snapshot_retention_days === "number" && Number.isFinite(features.snapshot_retention_days)) {
+        return Math.max(1, Math.floor(features.snapshot_retention_days));
+    }
+    return features.semantic_diff ? 90 : 30;
 }
 async function loadLatestSnapshot(client, monitorId) {
     const { rows } = await client.query(`select id, check_id, content_hash, text_normalized
@@ -234,7 +260,7 @@ async function recordChangeEvent(input) {
         after_hash: input.contentHash,
         ...diffArtifacts.diffBlob,
     });
-    await input.client.query(`insert into public.change_events (
+    const changeEventResult = await input.client.query(`insert into public.change_events (
       monitor_id,
       prev_snapshot_id,
       next_snapshot_id,
@@ -244,7 +270,7 @@ async function recordChangeEvent(input) {
       diff_blob
     ) values (
       $1, $2, $3, 'content', $4, $5, $6::jsonb
-    )`, [
+    ) returning id`, [
         input.job.monitor_id,
         input.previousSnapshot.id,
         input.nextSnapshotId,
@@ -252,6 +278,7 @@ async function recordChangeEvent(input) {
         diffArtifacts.summary,
         diffBlobJson,
     ]);
+    const changeEventId = changeEventResult.rows[0]?.id ?? null;
     await input.client.query(`insert into public.changes (
       monitor_id,
       org_id,
@@ -274,6 +301,14 @@ async function recordChangeEvent(input) {
     await input.client.query(`update public.monitors
      set last_change_at = $2
      where id = $1`, [input.job.monitor_id, input.fetchedAt]);
+    if (changeEventId && shouldCaptureChangeBlocks(input.planFeatures)) {
+        await insertPrimaryChangeBlock({
+            client: input.client,
+            changeEventId,
+            diffBlob: diffArtifacts.diffBlob,
+            summary: diffArtifacts.summary,
+        });
+    }
 }
 function summarizeDiff(beforeText, afterText) {
     if (!beforeText || !afterText) {
@@ -433,6 +468,78 @@ function sliceLength(changes, start, end) {
         total += chunkLength(changes[index]);
     }
     return total;
+}
+async function insertPrimaryChangeBlock(params) {
+    if (!isSegmentDiffBlobPayload(params.diffBlob)) {
+        return;
+    }
+    const action = determineBlockAction(params.diffBlob);
+    const excerpt = params.diffBlob.after_excerpt ?? params.diffBlob.before_excerpt ?? params.summary;
+    const title = buildBlockTitle(params.summary, excerpt);
+    const metadata = {
+        truncated_prefix: params.diffBlob.truncated_prefix,
+        truncated_suffix: params.diffBlob.truncated_suffix,
+        word_delta: params.diffBlob.word_delta ?? null,
+    };
+    await params.client.query(`insert into public.change_blocks (
+      change_event_id,
+      block_key,
+      action,
+      title,
+      text_excerpt,
+      metadata
+    ) values (
+      $1, $2, $3, $4, $5, $6::jsonb
+    )`, [
+        params.changeEventId,
+        "primary",
+        action,
+        title,
+        excerpt ? truncateToLength(excerpt, 600) : null,
+        JSON.stringify(metadata),
+    ]);
+}
+function isSegmentDiffBlobPayload(blob) {
+    return Boolean(blob &&
+        blob.type === "text_segments" &&
+        Array.isArray(blob.before_segments) &&
+        Array.isArray(blob.after_segments));
+}
+function determineBlockAction(blob) {
+    const hasBefore = blob.before_segments?.some((segment) => segment.kind !== "context");
+    const hasAfter = blob.after_segments?.some((segment) => segment.kind !== "context");
+    if (!hasBefore && hasAfter) {
+        return "added";
+    }
+    if (hasBefore && !hasAfter) {
+        return "removed";
+    }
+    if (typeof blob.word_delta === "number") {
+        if (blob.word_delta > 0)
+            return "added";
+        if (blob.word_delta < 0)
+            return "removed";
+    }
+    return "modified";
+}
+function buildBlockTitle(summary, excerpt) {
+    if (summary && summary !== "Content updated") {
+        return truncateToLength(summary, 120);
+    }
+    if (excerpt) {
+        const firstSentence = excerpt.split(/(?<=[.!?])\s+/)[0] ?? excerpt;
+        return truncateToLength(firstSentence, 120);
+    }
+    return "Content updated";
+}
+function truncateToLength(value, maxLength) {
+    if (!value) {
+        return null;
+    }
+    if (value.length <= maxLength) {
+        return value;
+    }
+    return `${value.slice(0, maxLength)}...`;
 }
 main().catch((error) => {
     console.error("[worker] Fatal error", error);

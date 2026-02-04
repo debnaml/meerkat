@@ -44,11 +44,20 @@ interface SnapshotDetail {
   content_hash: string | null;
 }
 
+interface DiffSegment {
+  kind: "context" | "added" | "removed";
+  text: string;
+}
+
 interface DiffBlob {
   type?: string;
   before_excerpt?: string | null;
   after_excerpt?: string | null;
   word_delta?: number | null;
+  before_segments?: DiffSegment[];
+  after_segments?: DiffSegment[];
+  truncated_prefix?: boolean;
+  truncated_suffix?: boolean;
   [key: string]: unknown;
 }
 
@@ -397,10 +406,11 @@ export default async function MonitorDetailPage({
 
 function DiffPreview({ change }: { change: ChangeEventDetail }) {
   const diffBlob = change.diff_blob ?? null;
+  const segmentDiff = isSegmentDiffBlob(diffBlob) ? diffBlob : null;
   const beforeText = extractSnapshotText(change.prev_snapshot, diffBlob, "before");
   const afterText = extractSnapshotText(change.next_snapshot, diffBlob, "after");
   const wordDeltaLabel = formatWordDelta(diffBlob);
-  const diffTypeLabel = diffBlob?.type === "hash_only" ? "Hash comparison" : "Text excerpt";
+  const diffTypeLabel = describeDiffType(diffBlob);
   const summary = change.summary ?? "Content updated";
 
   return (
@@ -416,14 +426,114 @@ function DiffPreview({ change }: { change: ChangeEventDetail }) {
           </span>
         </div>
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
-        <DiffPanel
-          label="Previous snapshot"
-          text={beforeText}
-          fallback="No prior snapshot stored for this monitor."
-        />
-        <DiffPanel label="Latest snapshot" text={afterText} fallback="Snapshot text not available for this plan." />
+      {segmentDiff ? (
+        <>
+          <SegmentDiffView diff={segmentDiff} />
+          <SnapshotDetails beforeText={beforeText} afterText={afterText} />
+        </>
+      ) : (
+        <FallbackDiffPanels beforeText={beforeText} afterText={afterText} />
+      )}
+    </div>
+  );
+}
+
+function SegmentDiffView({ diff }: { diff: DiffBlob & { before_segments: DiffSegment[]; after_segments: DiffSegment[] } }) {
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <SegmentPanel
+        label="Previous snippet"
+        segments={diff.before_segments}
+        truncatedPrefix={diff.truncated_prefix}
+        truncatedSuffix={diff.truncated_suffix}
+        emptyFallback="No snippet available from the previous run."
+      />
+      <SegmentPanel
+        label="Latest snippet"
+        segments={diff.after_segments}
+        truncatedPrefix={diff.truncated_prefix}
+        truncatedSuffix={diff.truncated_suffix}
+        emptyFallback="No snippet captured for this run."
+      />
+    </div>
+  );
+}
+
+function SegmentPanel({
+  label,
+  segments,
+  truncatedPrefix,
+  truncatedSuffix,
+  emptyFallback,
+}: {
+  label: string;
+  segments: DiffSegment[];
+  truncatedPrefix?: boolean;
+  truncatedSuffix?: boolean;
+  emptyFallback: string;
+}) {
+  const hasSegments = Array.isArray(segments) && segments.length > 0;
+
+  return (
+    <div className="rounded-2xl border border-[var(--color-border-muted)] bg-[var(--color-surface-muted)] p-4">
+      <div className="flex items-center justify-between text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+        <span>{label}</span>
+        {!hasSegments && <span>—</span>}
       </div>
+      {hasSegments ? (
+        <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-[var(--color-text-primary)]">
+          {truncatedPrefix && <span className="text-[var(--color-text-muted)]">... </span>}
+          {segments.map((segment, index) => (
+            <span key={`${segment.kind}-${index}`} className={segmentClass(segment.kind)}>
+              {index > 0 ? " " : ""}
+              {segment.text}
+            </span>
+          ))}
+          {truncatedSuffix && <span className="text-[var(--color-text-muted)]"> ...</span>}
+        </p>
+      ) : (
+        <p className="mt-3 text-sm text-[var(--color-text-muted)]">{emptyFallback}</p>
+      )}
+    </div>
+  );
+}
+
+function SnapshotDetails({ beforeText, afterText }: { beforeText: string | null; afterText: string | null }) {
+  if (!beforeText && !afterText) {
+    return null;
+  }
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      {beforeText && (
+        <details className="rounded-2xl border border-[var(--color-border-muted)] bg-[var(--color-surface-muted)] p-4">
+          <summary className="cursor-pointer text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+            Full previous snapshot
+          </summary>
+          <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap text-sm text-[var(--color-text-primary)]">
+            {truncateText(beforeText, 2000)}
+          </pre>
+        </details>
+      )}
+      {afterText && (
+        <details className="rounded-2xl border border-[var(--color-border-muted)] bg-[var(--color-surface-muted)] p-4">
+          <summary className="cursor-pointer text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+            Full latest snapshot
+          </summary>
+          <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap text-sm text-[var(--color-text-primary)]">
+            {truncateText(afterText, 2000)}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function FallbackDiffPanels({ beforeText, afterText }: { beforeText: string | null; afterText: string | null }) {
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <DiffPanel label="Previous snapshot" text={beforeText} fallback="No prior snapshot stored for this monitor." />
+      <DiffPanel label="Latest snapshot" text={afterText} fallback="Snapshot text not available for this plan." />
     </div>
   );
 }
@@ -451,8 +561,8 @@ function extractSnapshotText(
   if (snapshot?.text_normalized) {
     return snapshot.text_normalized;
   }
-  if (diffBlob?.type === "text_excerpt") {
-    return side === "before" ? diffBlob.before_excerpt ?? null : diffBlob.after_excerpt ?? null;
+  if (diffBlob && (diffBlob.type === "text_excerpt" || diffBlob.type === "text_segments")) {
+    return side === "before" ? (diffBlob.before_excerpt as string | null) ?? null : (diffBlob.after_excerpt as string | null) ?? null;
   }
   return null;
 }
@@ -473,4 +583,40 @@ function formatWordDelta(diffBlob: DiffBlob | null) {
   }
   const sign = diffBlob.word_delta > 0 ? "+" : "";
   return `${sign}${diffBlob.word_delta} words`;
+}
+
+function describeDiffType(diffBlob: DiffBlob | null) {
+  if (!diffBlob) {
+    return "Unknown diff";
+  }
+  if (diffBlob.type === "text_segments") {
+    return "Focused snippet";
+  }
+  if (diffBlob.type === "hash_only") {
+    return "Hash comparison";
+  }
+  return "Text excerpt";
+}
+
+function isSegmentDiffBlob(diffBlob: DiffBlob | null): diffBlob is DiffBlob & {
+  before_segments: DiffSegment[];
+  after_segments: DiffSegment[];
+} {
+  return Boolean(
+    diffBlob &&
+      diffBlob.type === "text_segments" &&
+      Array.isArray(diffBlob.before_segments) &&
+      Array.isArray(diffBlob.after_segments)
+  );
+}
+
+function segmentClass(kind: DiffSegment["kind"]) {
+  switch (kind) {
+    case "added":
+      return "rounded-md bg-[var(--color-success-soft)] px-1.5 py-0.5 text-[var(--color-success-ink)]";
+    case "removed":
+      return "rounded-md bg-[var(--color-danger-soft)] px-1.5 py-0.5 text-[var(--color-danger-ink)]";
+    default:
+      return "text-[var(--color-text-primary)]";
+  }
 }

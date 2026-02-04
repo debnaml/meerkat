@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { Pool } from "pg";
+import { diffWords } from "diff";
 import { runBaselineCheck } from "../../web/lib/monitors/baseline-check";
 const DATABASE_URL = process.env.DATABASE_URL;
 const BATCH_SIZE = Number(process.env.WORKER_BATCH_SIZE ?? "5");
@@ -66,9 +67,10 @@ async function claimPendingJobs(limit) {
         where pc.id in (select id from candidates)
         returning pc.*
       )
-      select u.*, m.url, m.type, m.selector_css, m.interval_minutes, m.sensitivity
+      select u.*, m.url, m.type, m.selector_css, m.interval_minutes, m.sensitivity, o.plan_features
       from updated u
-      join public.monitors m on m.id = u.monitor_id;`, [limit]);
+      join public.monitors m on m.id = u.monitor_id
+      join public.orgs o on o.id = u.org_id;`, [limit]);
         await client.query("COMMIT");
         return rows;
     }
@@ -82,6 +84,7 @@ async function claimPendingJobs(limit) {
     }
 }
 async function handleJob(job) {
+    const planFeatures = parsePlanFeatures(job.plan_features);
     const baseline = await runBaselineCheck({
         url: job.url,
         mode: job.type,
@@ -91,6 +94,7 @@ async function handleJob(job) {
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
+        const previousSnapshot = await loadLatestSnapshot(client, job.monitor_id);
         const checkResult = await client.query(`insert into public.checks (
         monitor_id,
         org_id,
@@ -116,13 +120,45 @@ async function handleJob(job) {
             baseline.htmlBytes,
             baseline.finalUrl,
         ]);
+        const checkId = checkResult.rows[0].id;
+        const snapshotResult = await client.query(`insert into public.monitor_snapshots (
+        monitor_id,
+        check_id,
+        tier,
+        content_hash,
+        html_path,
+        text_normalized,
+        blocks_json,
+        expires_at
+      ) values (
+        $1, $2, $3, $4, null, $5, null, null
+      ) returning id`, [
+            job.monitor_id,
+            checkId,
+            null,
+            baseline.contentHash,
+            shouldStoreFullSnapshot(planFeatures) ? baseline.normalizedText : null,
+        ]);
+        const snapshotId = snapshotResult.rows[0].id;
         await client.query(`update public.monitors
        set last_checked_at = $2,
            last_success_at = $2,
            last_status = 'ok',
            last_check_id = $3,
            next_check_at = $4
-       where id = $1`, [job.monitor_id, baseline.fetchedAt, checkResult.rows[0].id, nextCheckAt]);
+       where id = $1`, [job.monitor_id, baseline.fetchedAt, checkId, nextCheckAt]);
+        if (previousSnapshot && previousSnapshot.content_hash !== baseline.contentHash) {
+            await recordChangeEvent({
+                client,
+                job,
+                previousSnapshot,
+                nextSnapshotId: snapshotId,
+                newCheckId: checkId,
+                baselineText: shouldStoreFullSnapshot(planFeatures) ? baseline.normalizedText : null,
+                fetchedAt: baseline.fetchedAt,
+                contentHash: baseline.contentHash,
+            });
+        }
         await client.query(`delete from public.pending_checks where id = $1`, [job.id]);
         await client.query("COMMIT");
     }
@@ -164,10 +200,239 @@ function addMinutes(iso, minutes) {
     return date.toISOString();
 }
 function truncateMessage(message, maxLength = 500) {
-    return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}…`;
+    return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}...`;
 }
 function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function parsePlanFeatures(raw) {
+    if (!raw)
+        return {};
+    return raw;
+}
+function shouldStoreFullSnapshot(features) {
+    if (typeof features.detailed_snapshots === "boolean") {
+        return features.detailed_snapshots;
+    }
+    return true;
+}
+async function loadLatestSnapshot(client, monitorId) {
+    const { rows } = await client.query(`select id, check_id, content_hash, text_normalized
+     from public.monitor_snapshots
+     where monitor_id = $1
+     order by created_at desc
+     limit 1`, [monitorId]);
+    return rows[0] ?? null;
+}
+async function recordChangeEvent(input) {
+    const beforeText = input.previousSnapshot.text_normalized;
+    const afterText = input.baselineText;
+    const diffArtifacts = summarizeDiff(beforeText, afterText);
+    const severity = mapSensitivityToSeverity(input.job.sensitivity);
+    const diffBlobJson = JSON.stringify({
+        before_hash: input.previousSnapshot.content_hash,
+        after_hash: input.contentHash,
+        ...diffArtifacts.diffBlob,
+    });
+    await input.client.query(`insert into public.change_events (
+      monitor_id,
+      prev_snapshot_id,
+      next_snapshot_id,
+      change_type,
+      severity,
+      summary,
+      diff_blob
+    ) values (
+      $1, $2, $3, 'content', $4, $5, $6::jsonb
+    )`, [
+        input.job.monitor_id,
+        input.previousSnapshot.id,
+        input.nextSnapshotId,
+        severity,
+        diffArtifacts.summary,
+        diffBlobJson,
+    ]);
+    await input.client.query(`insert into public.changes (
+      monitor_id,
+      org_id,
+      check_id_new,
+      check_id_old,
+      created_at,
+      summary,
+      severity
+    ) values (
+      $1, $2, $3, $4, $5, $6, $7
+    )`, [
+        input.job.monitor_id,
+        input.job.org_id,
+        input.newCheckId,
+        input.previousSnapshot.check_id ?? null,
+        input.fetchedAt,
+        diffArtifacts.summary,
+        severity,
+    ]);
+    await input.client.query(`update public.monitors
+     set last_change_at = $2
+     where id = $1`, [input.job.monitor_id, input.fetchedAt]);
+}
+function summarizeDiff(beforeText, afterText) {
+    if (!beforeText || !afterText) {
+        return {
+            summary: "Content updated",
+            diffBlob: {
+                type: "hash_only",
+            },
+        };
+    }
+    const beforeWords = beforeText.split(/\s+/).filter(Boolean);
+    const afterWords = afterText.split(/\s+/).filter(Boolean);
+    const delta = afterWords.length - beforeWords.length;
+    let summary;
+    if (delta === 0) {
+        summary = "Content updated";
+    }
+    else if (delta > 0) {
+        summary = delta === 1 ? "1 word added" : `${delta} words added`;
+    }
+    else {
+        const removed = Math.abs(delta);
+        summary = removed === 1 ? "1 word removed" : `${removed} words removed`;
+    }
+    const segmentBlob = buildSegmentDiff(beforeText, afterText);
+    const fallbackBlob = createExcerptBlob(beforeText, afterText);
+    return {
+        summary,
+        diffBlob: {
+            word_delta: delta,
+            ...(segmentBlob ?? fallbackBlob),
+        },
+    };
+}
+function mapSensitivityToSeverity(sensitivity) {
+    switch (sensitivity) {
+        case "strict":
+            return "high";
+        case "relaxed":
+            return "low";
+        default:
+            return "medium";
+    }
+}
+function buildSegmentDiff(beforeText, afterText) {
+    const normalizedChanges = normalizeChanges(diffWords(beforeText, afterText));
+    if (normalizedChanges.length === 0) {
+        return null;
+    }
+    const hasChange = normalizedChanges.some((change) => change.added || change.removed);
+    if (!hasChange) {
+        return null;
+    }
+    const window = selectChunkWindow(normalizedChanges);
+    const segmentSets = buildSegmentsFromWindow(window.chunks);
+    return {
+        type: "text_segments",
+        before_segments: segmentSets.beforeSegments,
+        after_segments: segmentSets.afterSegments,
+        before_excerpt: buildExcerpt(segmentSets.beforeSegments),
+        after_excerpt: buildExcerpt(segmentSets.afterSegments),
+        truncated_prefix: window.start > 0,
+        truncated_suffix: window.end < normalizedChanges.length - 1,
+    };
+}
+function createExcerptBlob(beforeText, afterText) {
+    return {
+        type: "text_excerpt",
+        before_excerpt: beforeText.slice(0, 400),
+        after_excerpt: afterText.slice(0, 400),
+    };
+}
+function normalizeChanges(changes) {
+    return changes
+        .map((change) => {
+        const normalized = change.value.replace(/\s+/g, " ").trim();
+        return {
+            ...change,
+            value: normalized,
+        };
+    })
+        .filter((change) => change.value.length > 0);
+}
+function selectChunkWindow(changes, maxChars = 480) {
+    const changeIndices = changes
+        .map((change, index) => ((change.added || change.removed) ? index : -1))
+        .filter((index) => index >= 0);
+    if (changeIndices.length === 0) {
+        return {
+            chunks: changes,
+            start: 0,
+            end: changes.length - 1,
+        };
+    }
+    let start = changeIndices[0];
+    let end = changeIndices[changeIndices.length - 1];
+    let currentLength = sliceLength(changes, start, end);
+    while (currentLength < maxChars && (start > 0 || end < changes.length - 1)) {
+        const prevLength = start > 0 ? chunkLength(changes[start - 1]) : Number.POSITIVE_INFINITY;
+        const nextLength = end < changes.length - 1 ? chunkLength(changes[end + 1]) : Number.POSITIVE_INFINITY;
+        if (prevLength <= nextLength && start > 0) {
+            start -= 1;
+            currentLength += prevLength;
+        }
+        else if (end < changes.length - 1) {
+            end += 1;
+            currentLength += nextLength;
+        }
+        else {
+            break;
+        }
+    }
+    return {
+        chunks: changes.slice(start, end + 1),
+        start,
+        end,
+    };
+}
+function buildSegmentsFromWindow(changes) {
+    const beforeSegments = [];
+    const afterSegments = [];
+    changes.forEach((change) => {
+        const text = change.value;
+        if (!text) {
+            return;
+        }
+        if (change.added) {
+            afterSegments.push({ kind: "added", text });
+        }
+        else if (change.removed) {
+            beforeSegments.push({ kind: "removed", text });
+        }
+        else {
+            const segment = { kind: "context", text };
+            beforeSegments.push(segment);
+            afterSegments.push(segment);
+        }
+    });
+    return { beforeSegments, afterSegments };
+}
+function buildExcerpt(segments, maxLength = 600) {
+    const combined = segments.map((segment) => segment.text).join(" ").trim();
+    if (!combined) {
+        return null;
+    }
+    if (combined.length <= maxLength) {
+        return combined;
+    }
+    return `${combined.slice(0, maxLength)}...`;
+}
+function chunkLength(change) {
+    return change.value.length;
+}
+function sliceLength(changes, start, end) {
+    let total = 0;
+    for (let index = start; index <= end; index += 1) {
+        total += chunkLength(changes[index]);
+    }
+    return total;
 }
 main().catch((error) => {
     console.error("[worker] Fatal error", error);

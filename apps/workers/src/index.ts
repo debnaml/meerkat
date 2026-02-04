@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { Pool, PoolClient } from "pg";
+import { diffWords, type Change } from "diff";
 
 import { runBaselineCheck } from "../../web/lib/monitors/baseline-check";
 import type { MonitorMode } from "../../web/lib/monitors/constants";
@@ -31,6 +32,21 @@ interface SnapshotSummary {
 interface PlanFeatures {
   detailed_snapshots?: boolean;
   semantic_diff?: boolean;
+}
+
+interface TextSegment {
+  kind: "context" | "added" | "removed";
+  text: string;
+}
+
+interface SegmentDiffBlob {
+  type: "text_segments";
+  before_segments: TextSegment[];
+  after_segments: TextSegment[];
+  before_excerpt: string | null;
+  after_excerpt: string | null;
+  truncated_prefix: boolean;
+  truncated_suffix: boolean;
 }
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -264,7 +280,7 @@ function addMinutes(iso: string, minutes: number) {
 }
 
 function truncateMessage(message: string, maxLength = 500) {
-  return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}…`;
+  return message.length <= maxLength ? message : `${message.slice(0, maxLength - 1)}...`;
 }
 
 function delay(ms: number) {
@@ -394,13 +410,14 @@ function summarizeDiff(beforeText: string | null, afterText: string | null) {
     summary = removed === 1 ? "1 word removed" : `${removed} words removed`;
   }
 
+  const segmentBlob = buildSegmentDiff(beforeText, afterText);
+  const fallbackBlob = createExcerptBlob(beforeText, afterText);
+
   return {
     summary,
     diffBlob: {
-      type: "text_excerpt",
       word_delta: delta,
-      before_excerpt: beforeText.slice(0, 400),
-      after_excerpt: afterText.slice(0, 400),
+      ...(segmentBlob ?? fallbackBlob),
     },
   };
 }
@@ -414,6 +431,137 @@ function mapSensitivityToSeverity(sensitivity: string | null) {
     default:
       return "medium";
   }
+}
+
+function buildSegmentDiff(beforeText: string, afterText: string): SegmentDiffBlob | null {
+  const normalizedChanges = normalizeChanges(diffWords(beforeText, afterText));
+  if (normalizedChanges.length === 0) {
+    return null;
+  }
+
+  const hasChange = normalizedChanges.some((change) => change.added || change.removed);
+  if (!hasChange) {
+    return null;
+  }
+
+  const window = selectChunkWindow(normalizedChanges);
+  const segmentSets = buildSegmentsFromWindow(window.chunks);
+
+  return {
+    type: "text_segments",
+    before_segments: segmentSets.beforeSegments,
+    after_segments: segmentSets.afterSegments,
+    before_excerpt: buildExcerpt(segmentSets.beforeSegments),
+    after_excerpt: buildExcerpt(segmentSets.afterSegments),
+    truncated_prefix: window.start > 0,
+    truncated_suffix: window.end < normalizedChanges.length - 1,
+  };
+}
+
+function createExcerptBlob(beforeText: string, afterText: string) {
+  return {
+    type: "text_excerpt" as const,
+    before_excerpt: beforeText.slice(0, 400),
+    after_excerpt: afterText.slice(0, 400),
+  };
+}
+
+function normalizeChanges(changes: Change[]) {
+  return changes
+    .map((change) => {
+      const normalized = change.value.replace(/\s+/g, " ").trim();
+      return {
+        ...change,
+        value: normalized,
+      } satisfies Change;
+    })
+    .filter((change) => change.value.length > 0);
+}
+
+function selectChunkWindow(changes: Change[], maxChars = 480) {
+  const changeIndices = changes
+    .map((change, index) => ((change.added || change.removed) ? index : -1))
+    .filter((index) => index >= 0);
+
+  if (changeIndices.length === 0) {
+    return {
+      chunks: changes,
+      start: 0,
+      end: changes.length - 1,
+    };
+  }
+
+  let start = changeIndices[0];
+  let end = changeIndices[changeIndices.length - 1];
+  let currentLength = sliceLength(changes, start, end);
+
+  while (currentLength < maxChars && (start > 0 || end < changes.length - 1)) {
+    const prevLength = start > 0 ? chunkLength(changes[start - 1]) : Number.POSITIVE_INFINITY;
+    const nextLength = end < changes.length - 1 ? chunkLength(changes[end + 1]) : Number.POSITIVE_INFINITY;
+
+    if (prevLength <= nextLength && start > 0) {
+      start -= 1;
+      currentLength += prevLength;
+    } else if (end < changes.length - 1) {
+      end += 1;
+      currentLength += nextLength;
+    } else {
+      break;
+    }
+  }
+
+  return {
+    chunks: changes.slice(start, end + 1),
+    start,
+    end,
+  };
+}
+
+function buildSegmentsFromWindow(changes: Change[]) {
+  const beforeSegments: TextSegment[] = [];
+  const afterSegments: TextSegment[] = [];
+
+  changes.forEach((change) => {
+    const text = change.value;
+    if (!text) {
+      return;
+    }
+
+    if (change.added) {
+      afterSegments.push({ kind: "added", text });
+    } else if (change.removed) {
+      beforeSegments.push({ kind: "removed", text });
+    } else {
+      const segment = { kind: "context", text } as const;
+      beforeSegments.push(segment);
+      afterSegments.push(segment);
+    }
+  });
+
+  return { beforeSegments, afterSegments };
+}
+
+function buildExcerpt(segments: TextSegment[], maxLength = 600) {
+  const combined = segments.map((segment) => segment.text).join(" ").trim();
+  if (!combined) {
+    return null;
+  }
+  if (combined.length <= maxLength) {
+    return combined;
+  }
+  return `${combined.slice(0, maxLength)}...`;
+}
+
+function chunkLength(change: Change) {
+  return change.value.length;
+}
+
+function sliceLength(changes: Change[], start: number, end: number) {
+  let total = 0;
+  for (let index = start; index <= end; index += 1) {
+    total += chunkLength(changes[index]);
+  }
+  return total;
 }
 
 main().catch((error) => {

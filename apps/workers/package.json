@@ -9,10 +9,12 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
+    "diff": "^8.0.3",
     "dotenv": "^16.4.5",
     "pg": "^8.13.0"
   },
   "devDependencies": {
+    "@types/diff": "^7.0.2",
     "@types/node": "^22.10.1",
     "@types/pg": "^8.11.6",
     "tsx": "^4.7.1",

@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { ChangeTimelineChart } from "@/components/change-timeline-chart";
 import { StatusBadge } from "@/components/status-badge";
 import { MonitorSettingsForm, type EditableMonitor } from "./monitor-settings-form";
+import { MonitorActionsMenu } from "./monitor-actions-menu";
 import { formatDate, formatRelative, describeInterval } from "@/lib/formatters";
 import { getServerComponentClient } from "@/lib/supabase/server-clients";
 
@@ -35,6 +36,30 @@ interface CheckRecord {
   status: string;
   http_status: number | null;
   error_message: string | null;
+}
+
+interface SnapshotDetail {
+  id: string;
+  text_normalized: string | null;
+  content_hash: string | null;
+}
+
+interface DiffBlob {
+  type?: string;
+  before_excerpt?: string | null;
+  after_excerpt?: string | null;
+  word_delta?: number | null;
+  [key: string]: unknown;
+}
+
+interface ChangeEventDetail {
+  id: string;
+  created_at: string;
+  summary: string | null;
+  severity: "low" | "medium" | "high" | null;
+  diff_blob: DiffBlob | null;
+  prev_snapshot: SnapshotDetail | null;
+  next_snapshot: SnapshotDetail | null;
 }
 
 function buildTimeline(changes: ChangeRecord[], days = 14) {
@@ -99,7 +124,33 @@ export default async function MonitorDetailPage({
     notFound();
   }
 
-  const [changesResult, checksResult] = await Promise.all([
+  const latestChangeQuery = supabase
+    .from("change_events")
+    .select(
+      `
+        id,
+        created_at,
+        summary,
+        severity,
+        diff_blob,
+        prev_snapshot:prev_snapshot_id (
+          id,
+          content_hash,
+          text_normalized
+        ),
+        next_snapshot:next_snapshot_id (
+          id,
+          content_hash,
+          text_normalized
+        )
+      `
+    )
+    .eq("monitor_id", id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<ChangeEventDetail>();
+
+  const [changesResult, checksResult, latestChangeResult] = await Promise.all([
     supabase
       .from("changes")
       .select("id, created_at, summary, severity")
@@ -114,6 +165,7 @@ export default async function MonitorDetailPage({
       .order("started_at", { ascending: false })
       .limit(8)
       .returns<CheckRecord[]>(),
+    latestChangeQuery,
   ]);
 
   if (changesResult.error) {
@@ -121,6 +173,9 @@ export default async function MonitorDetailPage({
   }
   if (checksResult.error) {
     throw new Error(checksResult.error.message);
+  }
+  if (latestChangeResult.error) {
+    throw new Error(latestChangeResult.error.message);
   }
 
   const changes = changesResult.data ?? [];
@@ -137,10 +192,11 @@ export default async function MonitorDetailPage({
     sensitivity: monitor.sensitivity,
     selector_css: monitor.selector_css,
   };
+  const latestChange = latestChangeResult.data ?? null;
 
   return (
     <div className="space-y-10">
-      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
           <Link
             href="/dashboard"
@@ -161,11 +217,14 @@ export default async function MonitorDetailPage({
             </a>
           </p>
         </div>
-        <div className="flex flex-col items-start gap-2 text-sm text-[var(--color-text-muted)] md:items-end">
-          <StatusBadge status={monitor.last_status} />
-          <p>Last checked {formatRelative(monitor.last_checked_at)}</p>
-          <p>Interval • {describeInterval(monitor.interval_minutes)}</p>
-          <p>{monitor.enabled ? "Monitoring" : "Paused"}</p>
+        <div className="flex flex-col items-start gap-3 text-sm text-[var(--color-text-muted)] md:items-end">
+          <MonitorActionsMenu monitorId={monitor.id} monitorName={monitor.name} enabled={monitor.enabled} />
+          <div className="flex flex-col items-start gap-1 text-sm text-[var(--color-text-muted)] md:items-end">
+            <StatusBadge status={monitor.last_status} />
+            <p>Last checked {formatRelative(monitor.last_checked_at)}</p>
+            <p>Interval • {describeInterval(monitor.interval_minutes)}</p>
+            <p>{monitor.enabled ? "Monitoring" : "Paused"}</p>
+          </div>
         </div>
       </div>
 
@@ -312,13 +371,106 @@ export default async function MonitorDetailPage({
         </section>
       </div>
 
-      <section className="rounded-2xl border border-dashed border-[var(--color-border-muted)] bg-[var(--color-surface-muted)] p-6">
-        <h2 className="text-xl font-semibold text-[var(--color-heading)]">Diff preview</h2>
-        <p className="mt-2 text-sm text-[var(--color-text-muted)]">
-          Visual diff viewer is coming soon. Once the worker stores snapshots, you&apos;ll see side-by-side comparisons
-          and text diffs here.
-        </p>
+      <section className="rounded-2xl border border-[var(--color-border-muted)] bg-[var(--color-surface-card)] p-6 shadow-sm">
+        <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+          <div>
+            <h2 className="text-xl font-semibold text-[var(--color-heading)]">Diff preview</h2>
+            <p className="text-sm text-[var(--color-text-muted)]">
+              Latest change comparison using stored snapshots and normalized text excerpts.
+            </p>
+          </div>
+          {latestChange && (
+            <span className="text-sm text-[var(--color-text-muted)]">Captured {formatRelative(latestChange.created_at)}</span>
+          )}
+        </div>
+        {latestChange ? (
+          <DiffPreview change={latestChange} />
+        ) : (
+          <p className="mt-4 text-sm text-[var(--color-text-muted)]">
+            No change diffs yet. Once a check detects a difference, you&apos;ll see the before/after snapshot text here.
+          </p>
+        )}
       </section>
     </div>
   );
+}
+
+function DiffPreview({ change }: { change: ChangeEventDetail }) {
+  const diffBlob = change.diff_blob ?? null;
+  const beforeText = extractSnapshotText(change.prev_snapshot, diffBlob, "before");
+  const afterText = extractSnapshotText(change.next_snapshot, diffBlob, "after");
+  const wordDeltaLabel = formatWordDelta(diffBlob);
+  const diffTypeLabel = diffBlob?.type === "hash_only" ? "Hash comparison" : "Text excerpt";
+  const summary = change.summary ?? "Content updated";
+
+  return (
+    <div className="mt-6 space-y-6">
+      <div className="rounded-2xl border border-[var(--color-border-muted)] bg-[var(--color-surface-muted)] p-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p className="text-base font-semibold text-[var(--color-text-primary)]">{summary}</p>
+            <p className="text-sm text-[var(--color-text-muted)]">{diffTypeLabel} · {wordDeltaLabel}</p>
+          </div>
+          <span className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${severityBadge(change.severity)}`}>
+            {change.severity ?? "low"}
+          </span>
+        </div>
+      </div>
+      <div className="grid gap-4 md:grid-cols-2">
+        <DiffPanel
+          label="Previous snapshot"
+          text={beforeText}
+          fallback="No prior snapshot stored for this monitor."
+        />
+        <DiffPanel label="Latest snapshot" text={afterText} fallback="Snapshot text not available for this plan." />
+      </div>
+    </div>
+  );
+}
+
+function DiffPanel({ label, text, fallback }: { label: string; text: string | null; fallback: string }) {
+  const displayText = text ? truncateText(text, 1200) : fallback;
+  return (
+    <div className="rounded-2xl border border-[var(--color-border-muted)] bg-[var(--color-surface-muted)] p-4">
+      <div className="flex items-center justify-between text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+        <span>{label}</span>
+        {text && <span className="font-mono text-[var(--color-text-muted)]">{text.length} chars</span>}
+      </div>
+      <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap text-sm text-[var(--color-text-primary)]">
+        {displayText}
+      </pre>
+    </div>
+  );
+}
+
+function extractSnapshotText(
+  snapshot: SnapshotDetail | null,
+  diffBlob: DiffBlob | null,
+  side: "before" | "after"
+) {
+  if (snapshot?.text_normalized) {
+    return snapshot.text_normalized;
+  }
+  if (diffBlob?.type === "text_excerpt") {
+    return side === "before" ? diffBlob.before_excerpt ?? null : diffBlob.after_excerpt ?? null;
+  }
+  return null;
+}
+
+function truncateText(value: string, maxLength: number) {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength)}...`;
+}
+
+function formatWordDelta(diffBlob: DiffBlob | null) {
+  if (!diffBlob || typeof diffBlob.word_delta !== "number" || Number.isNaN(diffBlob.word_delta)) {
+    return "Delta unknown";
+  }
+  if (diffBlob.word_delta === 0) {
+    return "No net change";
+  }
+  const sign = diffBlob.word_delta > 0 ? "+" : "";
+  return `${sign}${diffBlob.word_delta} words`;
 }
